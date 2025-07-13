@@ -6,14 +6,6 @@ from datetime import datetime
 import queue 
 import functools 
 
-# --- IMPORTANT NOTE ON PYTHON VERSION ---
-# If you are seeing errors like "missing ScriptRunContext" or
-# "st.session_state has no attribute 'price_data'" when processing
-# messages from a separate thread, it's highly likely you are using
-# an unsupported Python version (e.g., Python 3.13, which is pre-release).
-# Please ensure you are using a stable Python release like 3.9, 3.10, 3.11, or 3.12.
-# --- END IMPORTANT NOTE ---
-
 # --- Configuration ---
 BINANCE_API_KEY = ""
 BINANCE_API_SECRET = ""
@@ -49,17 +41,13 @@ def process_messages_from_queue():
     This function should be called from the main Streamlit thread.
     """
     if 'price_data' not in st.session_state:
-        st.session_state.price_data = {}
-        # print("--- [Main Thread] WARNING: price_data was missing in session_state, re-initializing.")
+        st.session_state.price_data = {} 
 
     while not st.session_state.message_queue.empty():
         try:
-            msg = st.session_state.message_queue.get_nowait() # Get message without blocking
-            # Debugging: print message being processed by main thread
-            # print(f"--- [Main Thread] Processing Message: {msg}")
+            msg = st.session_state.message_queue.get_nowait() 
 
             if 'e' not in msg:
-                # print(f"--- [Main Thread] Skipping message without 'e' key: {msg}")
                 continue
 
             if msg['e'] == '24hrMiniTicker': 
@@ -83,7 +71,6 @@ def process_messages_from_queue():
                         '24hr Volume (Quote)': f"{quote_volume:,.2f}",
                         'Last Updated': datetime.now().strftime("%H:%M:%S")
                     }
-                    # print(f"--- [Main Thread] SUCCESS: Updated data for {symbol}: {st.session_state.price_data[symbol]}")
                 except KeyError as e:
                     print(f"--- [Main Thread] ERROR: Missing expected key in 24hrMiniTicker message: {e} in {msg}")
                 except ValueError as e:
@@ -315,7 +302,6 @@ while st.session_state.is_websocket_running:
             except ValueError: 
                 return ''
 
-        # This line should now work after upgrading pandas
         styled_df = df.style.map(color_change, subset=['24hr Change %']) 
         
         data_placeholder.dataframe(styled_df, use_container_width=True)
