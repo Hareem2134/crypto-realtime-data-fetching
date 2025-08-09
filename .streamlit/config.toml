@@ -1,2 +1,2 @@
 [compatibility_mode]
-python_version = "3.13" # You can try "3.11" or "3.12" if 3.10 doesn't work.
+python_version = "3.10" # You can try "3.11" or "3.12" if 3.10 doesn't work.
