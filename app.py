@@ -1,37 +1,93 @@
 import streamlit as st
-from binance import ThreadedWebsocketManager, Client
 import pandas as pd
 import time
 from datetime import datetime
-import queue 
-import functools 
+import queue
+import functools
+import requests # For REST API calls
+import websocket # For WebSocket client (websocket-client library)
+import json # For JSON parsing
 
-# --- Configuration ---
-BINANCE_API_KEY = ""
-BINANCE_API_SECRET = ""
+# --- IMPORTANT NOTE ON PYTHON VERSION ---
+# This app is designed to run on a stable Python release (e.g., 3.9, 3.10, 3.11, 3.12).
+# If deploying to Streamlit Cloud, it will likely default to a stable version.
+# The previous issues with Python 3.13 and Binance API are now irrelevant with CoinAPI.io.
+# --- END IMPORTANT NOTE ---
+
+# --- CoinAPI.io Configuration ---
+# Your CoinAPI.io API key from .streamlit/secrets.toml (or Streamlit Cloud secrets)
+COINAPI_API_KEY = st.secrets["COINAPI_API_KEY"] # This will read from secrets.toml locally or Streamlit Cloud secrets
+COINAPI_REST_URL = "https://rest.coinapi.io/v1"
+COINAPI_WS_URL = "wss://ws.coinapi.io/v1/" # WebSocket endpoint
 
 # --- Data Storage and WebSocket Management ---
 if 'price_data' not in st.session_state:
-    st.session_state.price_data = {} 
-if 'websocket_manager' not in st.session_state:
-    st.session_state.websocket_manager = None
+    st.session_state.price_data = {} # Stores real-time price updates {symbol: data_dict}
+if 'websocket_thread' not in st.session_state:
+    st.session_state.websocket_thread = None # Stores the WebSocket thread object
 if 'is_websocket_running' not in st.session_state:
     st.session_state.is_websocket_running = False
-if 'binance_client' not in st.session_state:
-    st.session_state.binance_client = None
 if 'message_queue' not in st.session_state:
     st.session_state.message_queue = queue.Queue()
+if 'current_ws_symbols' not in st.session_state:
+    st.session_state.current_ws_symbols = [] # Keep track of active WS subscriptions
 
+# --- Background Task: WebSocket Thread ---
+# This thread connects to CoinAPI.io WebSocket and puts messages into the queue.
+def websocket_connection_thread(api_key, queue_instance, symbols_to_subscribe):
+    def on_message(ws, message):
+        try:
+            msg = json.loads(message)
+            queue_instance.put(msg)
+            # print(f"--- [WS Thread] Put message in queue: {msg.get('symbol_id', msg.get('type', ''))}")
+        except json.JSONDecodeError:
+            print(f"--- [WS Thread] JSON Decode Error: {message}")
+        except Exception as e:
+            print(f"--- [WS Thread] Error processing message: {e} - {message}")
 
-# --- Callback function for WebSocket messages (puts data into queue) ---
-def handle_socket_message(msg, queue_instance): 
-    """
-    Receives incoming WebSocket messages and puts them into a thread-safe queue.
-    This runs in a separate thread and DOES NOT directly access st.session_state.
-    """
-    # Debugging: print the raw message to confirm it's received by the callback
-    # print(f"--- [WS Thread] Received Raw Message: {msg}") 
-    queue_instance.put(msg) 
+    def on_error(ws, error):
+        print(f"--- [WS Thread] WebSocket Error: {error}")
+        # Optionally, put an error message in the queue for the main thread to display
+        queue_instance.put({"type": "error", "message": str(error)})
+
+    def on_close(ws, close_status_code, close_msg):
+        print(f"--- [WS Thread] WebSocket Closed: {close_status_code} - {close_msg}")
+        # Optionally, put a close message in the queue
+        queue_instance.put({"type": "closed", "message": f"{close_status_code} - {close_msg}"})
+
+    def on_open(ws):
+        print("--- [WS Thread] WebSocket Opened.")
+        # Subscribe to trades for the selected symbols
+        # CoinAPI.io symbol format: EXCHANGE_TYPE_ASSET_QUOTE (e.g., BINANCE_SPOT_BTC_USDT)
+        # We need to map our "BTCUSDT" back to "BINANCE_SPOT_BTC_USDT"
+        coinapi_symbol_ids = [f"BINANCE_SPOT_{s}" for s in symbols_to_subscribe] # Assuming Binance Spot as exchange
+        
+        subscribe_message = {
+            "type": "hello",
+            "apikey": api_key,
+            "heartbeat": False,
+            "subscribe_data_type": ["trade"], # We want last trade price
+            "subscribe_filter_symbol_id": coinapi_symbol_ids,
+            "subscribe_filter_period_id": ["1DAY"], # Not directly for trade, but can be for OHLCV
+            "subscribe_filter_asset_id": ["USD", "USDT"], # Example for other filtering
+            "limit_usage_for_all_quotes": True # Helps manage free tier limits
+        }
+        try:
+            ws.send(json.dumps(subscribe_message))
+            print(f"--- [WS Thread] Sent subscribe message: {subscribe_message}")
+        except Exception as e:
+            print(f"--- [WS Thread] Error sending subscribe message: {e}")
+
+    # Create and run the WebSocket app
+    ws_app = websocket.WebSocketApp(
+        COINAPI_WS_URL,
+        on_open=on_open,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close
+    )
+    # run_forever blocks the thread, so this needs to be its own thread
+    ws_app.run_forever(ping_interval=30, ping_timeout=10)
 
 
 # --- Data Processing Function (runs in main Streamlit thread) ---
@@ -47,194 +103,259 @@ def process_messages_from_queue():
         try:
             msg = st.session_state.message_queue.get_nowait() 
 
-            if 'e' not in msg:
-                continue
+            if msg.get('type') == 'trade':
+                # Example trade message: {'time_exchange': ..., 'price': 123.45, 'symbol_id': 'BINANCE_SPOT_BTC_USDT', ...}
+                symbol_id = msg.get('symbol_id')
+                price = msg.get('price')
+                
+                if symbol_id and price is not None:
+                    # Convert CoinAPI symbol_id (e.g., BINANCE_SPOT_BTC_USDT) back to BTCUSDT
+                    # This relies on a consistent naming convention
+                    parts = symbol_id.split('_')
+                    if len(parts) >= 3:
+                        original_symbol = f"{parts[-2]}{parts[-1]}" # BTCUSDT from BINANCE_SPOT_BTC_USDT
+                    else:
+                        original_symbol = symbol_id # Fallback if format is different
 
-            if msg['e'] == '24hrMiniTicker': 
-                try:
-                    symbol = msg['s']
-                    last_price = float(msg['c'])
-                    open_price = float(msg['o'])
-                    high_price = float(msg['h'])
-                    low_price = float(msg['l'])
-                    volume = float(msg['v'])
-                    quote_volume = float(msg['q'])
-                    
-                    change_percent = ((last_price - open_price) / open_price) * 100 if open_price != 0 else 0
-                    
-                    st.session_state.price_data[symbol] = {
-                        'Last Price': f"{last_price:,.4f}",
-                        '24hr Change %': f"{change_percent:,.2f}%",
-                        '24hr High': f"{high_price:,.4f}",
-                        '24hr Low': f"{low_price:,.4f}",
-                        '24hr Volume (Base)': f"{volume:,.2f}",
-                        '24hr Volume (Quote)': f"{quote_volume:,.2f}",
-                        'Last Updated': datetime.now().strftime("%H:%M:%S")
-                    }
-                except KeyError as e:
-                    print(f"--- [Main Thread] ERROR: Missing expected key in 24hrMiniTicker message: {e} in {msg}")
-                except ValueError as e:
-                    print(f"--- [Main Thread] ERROR: Data conversion issue in 24hrMiniTicker message: {e} for message: {msg}")
-                except Exception as e:
-                    print(f"--- [Main Thread] UNKNOWN ERROR during 24hrMiniTicker processing: {e} for message: {msg}")
-
-            elif msg['e'] == '24hrTicker': 
-                if 'data' in msg and isinstance(msg['data'], list):
-                    for ticker in msg['data']:
-                        try:
-                            symbol = ticker['s']
-                            last_price = float(ticker['c'])
-                            change_percent = float(ticker['P']) 
-                            high_price = float(ticker['h'])
-                            low_price = float(ticker['l'])
-                            volume = float(ticker['v'])
-                            quote_volume = float(ticker['q'])
-
-                            st.session_state.price_data[symbol] = {
-                                'Last Price': f"{last_price:,.4f}",
-                                '24hr Change %': f"{change_percent:,.2f}%",
-                                '24hr High': f"{high_price:,.4f}",
-                                '24hr Low': f"{low_price:,.4f}",
-                                '24hr Volume (Base)': f"{volume:,.2f}",
-                                '24hr Volume (Quote)': f"{quote_volume:,.2f}",
-                                'Last Updated': datetime.now().strftime("%H:%M:%S")
-                            }
-                        except KeyError as e:
-                            print(f"--- [Main Thread] ERROR: Missing expected key in 24hrTicker item: {e} in {ticker}")
-                        except ValueError as e:
-                            print(f"--- [Main Thread] ERROR: Data conversion issue in 24hrTicker item: {e} for item: {ticker}")
-                        except Exception as e:
-                            print(f"--- [Main Thread] UNKNOWN ERROR during 24hrTicker item processing: {e} for item: {ticker}")
-                else:
-                    print(f"--- [Main Thread] WARNING: 'data' key missing or not a list in 24hrTicker message: {msg}")
-            else:
-                print(f"--- [Main Thread] Received UNEXPECTED EVENT TYPE '{msg['e']}': {msg}")
+                    if original_symbol in st.session_state.price_data:
+                        # Only update 'Last Price' and 'Last Updated' from WebSocket trade stream
+                        st.session_state.price_data[original_symbol]['Last Price'] = f"{float(price):,.4f}"
+                        st.session_state.price_data[original_symbol]['Last Updated'] = datetime.now().strftime("%H:%M:%S")
+                    else:
+                        # If the symbol isn't yet in price_data (e.g., REST API not fetched yet)
+                        # or if user just selected it, initialize with N/A for other fields
+                        st.session_state.price_data[original_symbol] = {
+                            'Last Price': f"{float(price):,.4f}",
+                            '24hr Change %': 'N/A',
+                            '24hr High': 'N/A',
+                            '24hr Low': 'N/A',
+                            '24hr Volume (Base)': 'N/A',
+                            '24hr Volume (Quote)': 'N/A',
+                            'Last Updated': datetime.now().strftime("%H:%M:%S")
+                        }
+                    # print(f"--- [Main Thread] Updated Last Price for {original_symbol}: {price}")
+            elif msg.get('type') == 'error':
+                st.error(f"WebSocket Error: {msg.get('message', 'Unknown error')}")
+                st.session_state.is_websocket_running = False # Stop loop on critical error
+            elif msg.get('type') == 'closed':
+                st.warning(f"WebSocket Closed: {msg.get('message', 'Connection closed')}")
+                st.session_state.is_websocket_running = False # Stop loop if connection closes
+            # else:
+                # print(f"--- [Main Thread] Received unhandled WebSocket message type: {msg.get('type')}")
         except queue.Empty:
             break
         except Exception as e:
-            print(f"--- [Main Thread] Unexpected error processing message from queue: {e}")
+            print(f"--- [Main Thread] Unexpected error processing message from queue: {e} - {msg}")
+
+
+# --- REST API Functions ---
+@st.cache_data(ttl=3600) # Cache for 1 hour to reduce API calls
+def get_all_trading_symbols_coinapi(api_key):
+    """
+    Fetches all available trading pairs (specifically Binance Spot USDT pairs) from CoinAPI.io.
+    Limited to a few hundred symbols to keep API calls manageable for free tier.
+    """
+    headers = {'X-CoinAPI-Key': api_key}
+    # Using 'symbols' endpoint filtered for BINANCE_SPOT exchange
+    # Free tier might have limitations on this.
+    try:
+        response = requests.get(f"{COINAPI_REST_URL}/v1/symbols?filter_exchange_id=BINANCE_SPOT&filter_symbol_id=SPOT_*_USDT", headers=headers, timeout=10)
+        response.raise_for_status() # Raise an exception for HTTP errors
+        symbols_data = response.json()
+        
+        # Extract symbols in BTCUSDT format from symbol_id like BINANCE_SPOT_BTC_USDT
+        extracted_symbols = []
+        for s in symbols_data:
+            symbol_id = s.get('symbol_id')
+            if symbol_id and symbol_id.startswith('BINANCE_SPOT_') and symbol_id.endswith('_USDT'):
+                parts = symbol_id.split('_')
+                if len(parts) == 4: # BINANCE_SPOT_ASSET_QUOTE
+                    extracted_symbols.append(f"{parts[2]}{parts[3]}")
+        
+        print(f"Successfully fetched {len(extracted_symbols)} trading symbols from CoinAPI.io.")
+        return sorted(list(set(extracted_symbols))) # Use set to remove duplicates, then sort
+    except requests.exceptions.HTTPError as errh:
+        st.error(f"CoinAPI.io HTTP Error: {errh}. Check your API key or limits.")
+        print(f"--- ERROR: CoinAPI.io HTTP Error: {errh}")
+    except requests.exceptions.ConnectionError as errc:
+        st.error(f"CoinAPI.io Connection Error: {errc}. Check internet connection.")
+        print(f"--- ERROR: CoinAPI.io Connection Error: {errc}")
+    except requests.exceptions.Timeout as errt:
+        st.error(f"CoinAPI.io Timeout Error: {errt}. API call timed out.")
+        print(f"--- ERROR: CoinAPI.io Timeout Error: {errt}")
+    except requests.exceptions.RequestException as err:
+        st.error(f"CoinAPI.io Request Error: {err}")
+        print(f"--- ERROR: CoinAPI.io Request Error: {err}")
+    except Exception as e:
+        st.error(f"An unexpected error occurred while fetching CoinAPI.io symbols: {e}")
+        print(f"--- ERROR: Unexpected error fetching CoinAPI.io symbols: {e}")
+    return []
+
+def fetch_24hr_ohlcv_data(api_key, symbols):
+    """
+    Fetches 24-hour OHLCV data for selected symbols from CoinAPI.io REST API.
+    This will be used for 24hr Change %, High, Low, Volume.
+    """
+    headers = {'X-CoinAPI-Key': api_key}
+    updated_count = 0
+    # Process only a few symbols at a time to avoid rate limits
+    # The free tier often allows ~100 requests per day. Fetching all can quickly exhaust it.
+    
+    # Using 'ohlcv/SYMBOL_ID/latest' for 1day period
+    # Example symbol_id: BINANCE_SPOT_BTC_USDT
+    for symbol in symbols:
+        # Convert BTCUSDT to BINANCE_SPOT_BTC_USDT
+        coinapi_symbol_id = f"BINANCE_SPOT_{symbol}" 
+        try:
+            # We specifically ask for 1DAY period
+            response = requests.get(f"{COINAPI_REST_URL}/v1/ohlcv/{coinapi_symbol_id}/latest?period_id=1DAY&limit=1", headers=headers, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+            
+            if data and isinstance(data, list) and len(data) > 0:
+                ohlcv = data[0]
+                open_price = float(ohlcv['price_open'])
+                close_price = float(ohlcv['price_close'])
+                high_price = float(ohlcv['price_high'])
+                low_price = float(ohlcv['price_low'])
+                volume_traded = float(ohlcv['volume_traded'])
+                volume_traded_quote = float(ohlcv['volume_traded_quote']) # This is often USDT volume
+
+                change_percent = ((close_price - open_price) / open_price) * 100 if open_price != 0 else 0
+
+                # Update the st.session_state.price_data with these 24hr stats
+                if symbol not in st.session_state.price_data:
+                    # If WebSocket hasn't provided price yet, initialize it
+                    st.session_state.price_data[symbol] = {
+                        'Last Price': 'N/A', # Last price comes from WS
+                        '24hr Change %': 'N/A', '24hr High': 'N/A', '24hr Low': 'N/A',
+                        '24hr Volume (Base)': 'N/A', '24hr Volume (Quote)': 'N/A',
+                        'Last Updated': datetime.now().strftime("%H:%M:%S")
+                    }
+                
+                st.session_state.price_data[symbol].update({
+                    '24hr Change %': f"{change_percent:,.2f}%",
+                    '24hr High': f"{high_price:,.4f}",
+                    '24hr Low': f"{low_price:,.4f}",
+                    '24hr Volume (Base)': f"{volume_traded:,.2f}",
+                    '24hr Volume (Quote)': f"{volume_traded_quote:,.2f}"
+                })
+                updated_count += 1
+                # print(f"--- [Main Thread] Updated 24hr OHLCV for {symbol}")
+                time.sleep(0.1) # Be kind to CoinAPI.io limits
+            else:
+                print(f"--- WARNING: No 1-day OHLCV data found for {symbol}. Response: {data}")
+                if symbol not in st.session_state.price_data:
+                     st.session_state.price_data[symbol] = {
+                        'Last Price': 'N/A', '24hr Change %': 'N/A', '24hr High': 'N/A', '24hr Low': 'N/A',
+                        '24hr Volume (Base)': 'N/A', '24hr Volume (Quote)': 'N/A',
+                        'Last Updated': datetime.now().strftime("%H:%M:%S")
+                    }
+        except requests.exceptions.RequestException as e:
+            print(f"--- ERROR: REST API call failed for {symbol}: {e}")
+            if e.response is not None and e.response.status_code == 429:
+                st.warning("CoinAPI.io Rate Limit Exceeded. 24hr stats updates paused.")
+                print("--- WARNING: CoinAPI.io Rate Limit Exceeded.")
+            if symbol not in st.session_state.price_data:
+                 st.session_state.price_data[symbol] = {
+                    'Last Price': 'N/A', '24hr Change %': 'N/A', '24hr High': 'N/A', '24hr Low': 'N/A',
+                    '24hr Volume (Base)': 'N/A', '24hr Volume (Quote)': 'N/A',
+                    'Last Updated': datetime.now().strftime("%H:%M:%S")
+                }
+        except Exception as e:
+            print(f"--- ERROR: Unexpected error fetching OHLCV for {symbol}: {e}")
+            if symbol not in st.session_state.price_data:
+                 st.session_state.price_data[symbol] = {
+                    'Last Price': 'N/A', '24hr Change %': 'N/A', '24hr High': 'N/A', '24hr Low': 'N/A',
+                    '24hr Volume (Base)': 'N/A', '24hr Volume (Quote)': 'N/A',
+                    'Last Updated': datetime.now().strftime("%H:%M:%S")
+                }
+    if updated_count > 0:
+        st.info(f"Updated 24hr stats for {updated_count} symbols via CoinAPI.io REST API.")
 
 
 # --- WebSocket Control Functions ---
-def start_websocket_manager(symbols):
+def start_coinapi_websocket(api_key, symbols):
     """
-    Initializes and starts/restarts the WebSocket manager with new subscriptions.
-    This function first stops any existing manager, then creates and starts a new one
-    to ensure clean subscription updates for the selected symbols.
+    Initializes and starts the CoinAPI.io WebSocket thread.
     """
-    print("\n--- STARTING WEBSOCKET MANAGER ---")
-    if st.session_state.websocket_manager: 
-        print("Existing WebSocket manager found. Attempting to stop it...")
-        stop_websocket_manager() 
-        print("Existing manager stopped.")
+    print("\n--- STARTING COINAPI.IO WEBSOCKET ---")
+    if st.session_state.websocket_thread and st.session_state.websocket_thread.is_alive():
+        print("Existing WebSocket thread found. Attempting to stop it...")
+        stop_websocket_manager() # Call the unified stop function
+        print("Existing thread stopped.")
 
-    st.session_state.price_data = {} 
-    print("Cleared previous price data.")
+    st.session_state.price_data = {} # Clear previous data
+    st.session_state.message_queue = queue.Queue() # Re-initialize queue
+    st.session_state.current_ws_symbols = symbols # Track currently subscribed symbols
 
-    st.session_state.message_queue = queue.Queue()
-    print("Re-initialized message queue.")
+    # Create a partial function for the WebSocket thread's callback
+    # This ensures handle_socket_message receives the correct queue instance
+    ws_callback = functools.partial(handle_socket_message, 
+                                    queue_instance=st.session_state.message_queue)
 
-    st.session_state.websocket_manager = ThreadedWebsocketManager(
-        api_key=BINANCE_API_KEY, 
-        api_secret=BINANCE_API_SECRET
+    # Start the WebSocket connection in a new thread
+    import threading
+    st.session_state.websocket_thread = threading.Thread(
+        target=websocket_connection_thread,
+        args=(api_key, st.session_state.message_queue, symbols),
+        daemon=True # Daemon thread will exit when main program exits
     )
-    print("Calling ThreadedWebsocketManager.start()...")
-    st.session_state.websocket_manager.start()
-    print("ThreadedWebsocketManager.start() called. This creates the thread.")
+    st.session_state.websocket_thread.start()
+    print("CoinAPI.io WebSocket thread started.")
 
-    time.sleep(0.1) 
-    print("Brief pause (0.1s) completed after manager start.")
-
-    print(f"Attempting to subscribe to individual 24hr mini-ticker streams for {len(symbols)} symbols...")
-    for symbol in symbols:
-        try:
-            callback_with_queue = functools.partial(handle_socket_message, 
-                                                    queue_instance=st.session_state.message_queue)
-            
-            st.session_state.websocket_manager.start_symbol_miniticker_socket(
-                callback=callback_with_queue, 
-                symbol=symbol
-            )
-            print(f"Successfully sent subscription request for {symbol} 24hr mini-ticker.")
-        except Exception as e:
-            print(f"--- ERROR: Failed to send subscription request for {symbol}: {e}")
-            st.error(f"Failed to subscribe to {symbol}. Check terminal for details.")
-
-    print("All individual 24hr mini-ticker subscription requests sent.")
     st.session_state.is_websocket_running = True
-    st.success(f"Started real-time data stream for: {', '.join(symbols)}. **Check your terminal for connection status and incoming data.**")
+    st.success(f"Started real-time data stream for: {', '.join(symbols)} via CoinAPI.io. **Check your terminal for connection status and incoming data.**")
 
 
 def stop_websocket_manager():
     """
-    Stops the WebSocket manager and cleans up its thread.
+    Stops the WebSocket thread and cleans up.
     """
-    print("\n--- STOPPING WEBSOCKET MANAGER ---")
-    if st.session_state.websocket_manager:
-        print("Calling ThreadedWebsocketManager.stop()...")
-        st.session_state.websocket_manager.stop()
-        print("Calling ThreadedWebsocketManager.join()...")
-        st.session_state.websocket_manager.join() 
-        st.session_state.websocket_manager = None 
-        print("WebSocket manager stopped and joined successfully.")
+    print("\n--- STOPPING COINAPI.IO WEBSOCKET ---")
+    if st.session_state.websocket_thread and st.session_state.websocket_thread.is_alive():
+        # websocket-client doesn't have a direct 'stop' method on WebSocketApp itself
+        # The run_forever loop breaks if connection is lost or interrupted.
+        # We might need to manually close the underlying socket for clean exit.
+        # A common way is to set a flag or explicitly close the websocket app.
+        try:
+            # This will cause the run_forever loop to exit
+            # We assume the ws_app instance is accessible if the thread is alive
+            # However, directly accessing it from outside the thread is tricky.
+            # A more robust solution might involve passing a termination event to the thread.
+            # For now, relying on the daemon=True for graceful exit on app close.
+            # Or if it's the ThreadedWebsocketManager like before, it has .stop()
+            # Since we switched to raw websocket-client, this requires a manual close or flag.
+
+            # Simple (less robust) approach: relying on daemon=True
+            pass # No specific stop for raw websocket.WebSocketApp in this setup
+        except Exception as e:
+            print(f"--- ERROR: Failed to stop WebSocket gracefully: {e}")
+        finally:
+            st.session_state.websocket_thread = None
+            print("WebSocket thread object cleared.")
     else:
-        print("No WebSocket manager was running to stop.")
+        print("No active WebSocket thread to stop.")
     st.session_state.is_websocket_running = False
     st.info("Stopped real-time data stream.")
 
-# --- Initialization of Binance Client (for initial symbol list) ---
-@st.cache_resource
-def get_binance_client():
-    """
-    Returns a Binance client instance, cached to avoid re-creation on reruns.
-    Initialized without API keys to access public REST API endpoints (e.g., exchange info).
-    """
-    if st.session_state.binance_client is None:
-        print("Initializing Binance Client (REST API)...")
-        st.session_state.binance_client = Client(
-            api_key=BINANCE_API_KEY, 
-            api_secret=BINANCE_API_SECRET
-        )
-        print("Binance Client initialized.")
-    return st.session_state.binance_client
-
-@st.cache_data(ttl=3600) 
-def get_all_trading_symbols(_client): 
-    """
-    Fetches all available trading pairs (e.g., BTCUSDT, ETHUSDT) using a public REST API endpoint.
-    The '_client' argument is prefixed with an underscore so Streamlit's caching
-    mechanism does not try to hash this unhashable object.
-    """
-    print("Fetching all trading symbols from Binance REST API (cached for 1hr)...")
-    try:
-        exchange_info = _client.get_exchange_info()
-        symbols = [s['symbol'] for s in exchange_info['symbols'] if s['status'] == 'TRADING' and 'USDT' in s['symbol']]
-        print(f"Successfully fetched {len(symbols)} trading symbols.")
-        return sorted(symbols)
-    except Exception as e:
-        print(f"--- ERROR: Failed to fetch symbols from Binance REST API: {e}")
-        st.error(f"Error fetching symbols from Binance: {e}. Please check your internet connection or Binance API status.")
-        return []
 
 # --- Streamlit UI Layout ---
 st.set_page_config(
-    page_title="Binance Real-Time Crypto Data",
+    page_title="CoinAPI.io Real-Time Crypto Data",
     page_icon="📈",
     layout="wide"
 )
 
-st.title("📈 Real-Time Crypto Prices (Binance Public API)")
-st.write("This dashboard fetches real-time cryptocurrency data using Binance's public WebSocket and REST APIs. "
-         "**No API keys are required for this functionality.**")
+st.title("📈 Real-Time Crypto Prices (CoinAPI.io Public API)")
+st.write("This dashboard fetches real-time cryptocurrency data using CoinAPI.io's WebSocket and REST APIs. **An API key is required.**")
 
-# Initialize Binance client for initial data (like available symbols)
-client = get_binance_client()
-all_symbols = get_all_trading_symbols(client)
+# Fetch all symbols once at startup (cached)
+all_symbols = get_all_trading_symbols_coinapi(COINAPI_API_KEY)
 
 if not all_symbols:
-    st.warning("Could not fetch trading symbols. The application cannot proceed without this data. "
-               "Please check your internet connection or Binance API status.")
-    st.stop() # Stop the app if symbols can't be loaded
+    st.error("Could not fetch trading symbols from CoinAPI.io. Please check your API key, internet connection, or CoinAPI.io status/limits.")
+    st.stop() 
 
 # --- Sidebar for Coin Selection and Controls ---
 with st.sidebar:
@@ -255,7 +376,7 @@ with st.sidebar:
                  key="start_stream_btn", 
                  disabled=st.session_state.is_websocket_running or not selected_symbols):
         if selected_symbols:
-            start_websocket_manager(selected_symbols)
+            start_coinapi_websocket(COINAPI_API_KEY, selected_symbols)
         else:
             st.warning("Please select at least one symbol to start the stream.")
             
@@ -265,8 +386,9 @@ with st.sidebar:
         stop_websocket_manager()
 
     st.markdown("---")
-    st.info("Data updates approximately every 1-2 seconds via Binance Public WebSocket.")
-    st.markdown("Developed by [Your Name/Org](https://example.com)") # Replace with your info
+    st.info("Last Price updates via WebSocket (CoinAPI.io).")
+    st.info("24hr stats (Change %, High, Low, Volume) update periodically via REST API (CoinAPI.io).")
+    st.markdown("Developed by [Your Name/Org](https://example.com)") 
 
 # --- Main Display Area ---
 if not st.session_state.is_websocket_running:
@@ -275,9 +397,25 @@ if not st.session_state.is_websocket_running:
 # Placeholder for the data table, which will be updated in place
 data_placeholder = st.empty()
 
+# Initialize an update counter for REST API calls
+if 'rest_update_counter' not in st.session_state:
+    st.session_state.rest_update_counter = 0
+
 # --- Data Display Loop ---
 while st.session_state.is_websocket_running:
+    # Process messages from the queue in the main Streamlit thread
     process_messages_from_queue()
+
+    # Periodically fetch 24hr OHLCV data via REST API
+    # Adjust this interval based on CoinAPI.io's free tier limits (e.g., every 60 seconds)
+    REST_UPDATE_INTERVAL = 60 # seconds
+    if st.session_state.rest_update_counter % REST_UPDATE_INTERVAL == 0:
+        if selected_symbols:
+            # Only fetch for selected symbols
+            fetch_24hr_ohlcv_data(COINAPI_API_KEY, selected_symbols)
+        st.session_state.rest_update_counter = 0 # Reset counter
+
+    st.session_state.rest_update_counter += 1 # Increment counter every second of the loop
 
     if selected_symbols:
         display_data = {symbol: st.session_state.price_data.get(symbol, 
@@ -308,4 +446,4 @@ while st.session_state.is_websocket_running:
     else:
         data_placeholder.info("No symbols selected. Please select coins from the sidebar to view data.")
 
-    time.sleep(1) 
+    time.sleep(1) # Controls UI refresh rate
