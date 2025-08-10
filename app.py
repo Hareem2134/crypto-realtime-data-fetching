@@ -159,7 +159,7 @@ def get_all_trading_symbols_coinapi(api_key):
     # Using 'symbols' endpoint filtered for BINANCE_SPOT exchange
     # Free tier might have limitations on this.
     try:
-        response = requests.get(f"{COINAPI_REST_URL}/v1/symbols?filter_exchange_id=BINANCE_SPOT&filter_symbol_id=SPOT_*_USDT", headers=headers, timeout=10)
+        response = requests.get(f"{COINAPI_REST_URL}/symbols?filter_exchange_id=BINANCE_SPOT&filter_symbol_id=SPOT_*_USDT", headers=headers, timeout=10)
         response.raise_for_status() # Raise an exception for HTTP errors
         symbols_data = response.json()
         
@@ -208,7 +208,7 @@ def fetch_24hr_ohlcv_data(api_key, symbols):
         coinapi_symbol_id = f"BINANCE_SPOT_{symbol}" 
         try:
             # We specifically ask for 1DAY period
-            response = requests.get(f"{COINAPI_REST_URL}/v1/ohlcv/{coinapi_symbol_id}/latest?period_id=1DAY&limit=1", headers=headers, timeout=5)
+            response = requests.get(f"{COINAPI_REST_URL}/ohlcv/{coinapi_symbol_id}/latest?period_id=1DAY&limit=1", headers=headers, timeout=5)
             response.raise_for_status()
             data = response.json()
             
